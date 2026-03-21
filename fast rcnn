@@ -1,0 +1,395 @@
+import torch
+import torch.nn as nn
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+import numpy as np
+from PIL import Image
+from torchvision import transforms # Import transforms
+import torch.nn.functional as F
+# from torchvision.ops import roi_align # Removed: No new libraries
+
+# Set manual seed for reproducibility
+torch.manual_seed(0)
+
+# --- 1. Utility Functions ---
+
+def calculate_iou(box1, box2):
+    # box1: (..., 4), box2: (..., 4)
+    # The '...' denotes any number of batch dimensions that will be broadcasted.
+    # For example, if box1 is (N, 1, 4) and box2 is (1, M, 4), they will broadcast to (N, M, 4)
+
+    x1 = torch.max(box1[..., 0], box2[..., 0])
+    y1 = torch.max(box1[..., 1], box2[..., 1])
+    x2 = torch.min(box1[..., 2], box2[..., 2])
+    y2 = torch.min(box1[..., 3], box2[..., 3])
+
+    intersection_w = torch.clamp(x2 - x1, min=0)
+    intersection_h = torch.clamp(y2 - y1, min=0)
+    intersection = intersection_w * intersection_h
+
+    area1 = (box1[..., 2] - box1[..., 0]) * (box1[..., 3] - box1[..., 1])
+    area2 = (box2[..., 2] - box2[..., 0]) * (box2[..., 3] - box2[..., 1])
+
+    union = area1 + area2 - intersection + 1e-6 # Add epsilon for numerical stability
+
+    iou = intersection / union
+    return iou
+
+def nms(boxes, scores, threshold=0.5):
+    if boxes.numel() == 0: return torch.tensor([])
+
+    x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+    areas = (x2 - x1) * (y2 - y1)
+    _, order = scores.sort(0, descending=True)
+
+    keep = []
+    while order.numel() > 0:
+        i = order[0]
+        keep.append(i.item())
+        if order.numel() == 1: break
+
+        xx1 = torch.max(x1[order[1:]], x1[i])
+        yy1 = torch.max(y1[order[1:]], y1[i])
+        xx2 = torch.min(x2[order[1:]], x2[i])
+        yy2 = torch.min(y2[order[1:]], y2[i])
+
+        inter = torch.clamp(xx2 - xx1, min=0) * torch.clamp(yy2 - yy1, min=0)
+        iou = inter / (areas[i] + areas[order[1:]] - inter + 1e-6)
+
+        order = order[1:][iou <= threshold]
+
+    return torch.tensor(keep)
+
+def bbox_transform(ex_rois, gt_rois):
+    # Calculate proposal centers and dimensions
+    ex_widths = ex_rois[:, 2] - ex_rois[:, 0]
+    ex_heights = ex_rois[:, 3] - ex_rois[:, 1]
+    ex_ctr_x = ex_rois[:, 0] + 0.5 * ex_widths
+    ex_ctr_y = ex_rois[:, 1] + 0.5 * ex_heights
+
+    # Calculate ground truth centers and dimensions
+    gt_widths = gt_rois[:, 2] - gt_rois[:, 0]
+    gt_heights = gt_rois[:, 3] - gt_rois[:, 1]
+    gt_ctr_x = gt_rois[:, 0] + 0.5 * gt_widths
+    gt_ctr_y = gt_rois[:, 1] + 0.5 * gt_heights
+
+    targets_dx = (gt_ctr_x - ex_ctr_x) / (ex_widths + 1e-6)
+    targets_dy = (gt_ctr_y - ex_ctr_y) / (ex_heights + 1e-6)
+    targets_dw = torch.log(gt_widths / (ex_widths + 1e-6))
+    targets_dh = torch.log(gt_heights / (ex_heights + 1e-6))
+
+    targets = torch.stack((targets_dx, targets_dy, targets_dw, targets_dh), dim=1)
+    return targets
+
+
+# --- 2. RoIPooling Layer (FIXED) ---
+def roi_pooling(feature_map, rois, output_size):
+    pooled_features = []
+
+    # Corrected: Original image size based on model_transform.Resize((5, 5)) in this specific cell
+    original_image_size = 224 # Based on model_transform.Resize((224, 224)) for full image, then conv scales
+
+    # Calculate scaling factors from original image space to feature map space
+    feature_map_height, feature_map_width = feature_map.shape[2:]
+    scale_h = feature_map_height / original_image_size
+    scale_w = feature_map_width / original_image_size
+
+    for roi in rois:
+        # Scale ROI coordinates from original image space to feature map space
+        x1_scaled = roi[1] * scale_w
+        y1_scaled = roi[2] * scale_h
+        x2_scaled = roi[3] * scale_w
+        y2_scaled = roi[4] * scale_h
+
+        # Clamp coordinates to be within feature map bounds and convert to int
+        x1 = max(0, min(int(round(x1_scaled.item())), feature_map_width))
+        y1 = max(0, min(int(round(y1_scaled.item())), feature_map_height))
+        x2 = max(0, min(int(round(x2_scaled.item())), feature_map_width))
+        y2 = max(0, min(int(round(y2_scaled.item())), feature_map_height))
+
+        # Check if the resulting cropped region is valid (non-empty)
+        if x1 >= x2 or y1 >= y2:
+            # If the cropped region is empty or invalid, create a zero tensor
+            num_channels = feature_map.shape[1]
+            pooled_roi = torch.zeros(1, num_channels, output_size[0], output_size[1], device=feature_map.device)
+        else:
+            # Extract the region of interest from the feature map
+            roi_cart = feature_map[0:1, :, y1:y2, x1:x2]
+            pooled_roi = F.adaptive_max_pool2d(roi_cart, output_size)
+        pooled_features.append(pooled_roi)
+
+    if not pooled_features:
+        # If no valid ROIs were processed, return an empty tensor of the expected shape
+        num_channels = feature_map.shape[1]
+        return torch.empty(0, num_channels, output_size[0], output_size[1], device=feature_map.device)
+
+    return torch.cat(pooled_features, dim=0)
+
+
+# --- 3. FastRCNN Model (SimpleFeatureExtractor) ---
+
+class FastRCNNModel(nn.Module):
+    def __init__(self, num_classes=2):
+        super().__init__()
+        # Instantiate the shared Backbone
+        self.backbone = Backbone()
+
+        self.classifier = nn.Sequential(
+            nn.Flatten(), # (N_rois, 3, 1, 1) -> (N_rois, 3*1*1)
+            nn.Linear(3 * 1 * 1, num_classes) # Adjusted input features for 1x1 pooled output
+        )
+
+        self.bbox_regressor = nn.Sequential(
+            nn.Flatten(), # (N_rois, 3, 1, 1) -> (N_rois, 3*1*1)
+            nn.Linear(3* 1 * 1, num_classes * 4) # Adjusted input features for 1x1 pooled output
+        )
+
+    def forward(self, x, rois):
+        # 1. Extract feature map from the entire image using the backbone
+        feature_map = self.backbone(x) # x is (1, 3, 5, 5), feature_map is (1, 3, 1, 1)
+
+        # 2. Apply RoI Pooling to get features for each RoI
+        pooled_features = roi_pooling(feature_map, rois, (1,1)) # pooled_features is (N_rois, 3, 1, 1)
+
+        # 3. Predict class scores
+        class_scores = self.classifier(pooled_features)
+
+        # 4. Predict bounding box offsets
+        bbox_predictions = self.bbox_regressor(pooled_features)
+        return class_scores, bbox_predictions
+
+
+# --- 4. Data Preparation ---
+
+model_transform = transforms.Compose([
+    transforms.Resize((224, 224)), # Use 224x224 as original input image size for scaling ROIs
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+display_transform = transforms.Compose([
+    transforms.Resize((224, 224))
+])
+
+img_original = Image.open('dog.JPG').convert('RGB')
+img_resized_for_display = display_transform(img_original)
+input_image = model_transform(img_original).unsqueeze(0) # Add batch dimension
+
+# Dummy Region Proposals (e.g., from Selective Search)
+proposals = torch.tensor(
+    [[50, 50, 180, 180], # Good proposal 1, covers most of the dog
+    [60, 60, 170, 170], # Good proposal 2, overlapping with 1
+    [45, 45, 185, 185], # Good proposal 3, slightly larger, overlapping with 1 and 2
+    [80, 80, 120, 120], # Smaller proposal on part of the dog (e.g., head/body)
+    [10, 10, 30, 30],    # Clearly bad proposal, far from dog
+    [190, 190, 220, 220] # Another bad proposal
+], dtype=torch.float)
+
+# Dummy Ground Truth Bounding Box and Label
+gt_boxes = torch.tensor([[55, 55, 175, 175]], dtype=torch.float)
+gt_labels = torch.tensor([1], dtype=torch.long) # 1 for 'dog'
+
+# Hyperparameters for training target assignment
+POS_IOU_THRESHOLD = 0.5
+NEG_IOU_THRESHOLD = 0.1 # Proposals with IoU between these are ignored
+um_classes = 2 # 0: background, 1: dog
+class_labels = ['background', 'dog']
+
+# Initialize target_labels with -1 to indicate 'ignore'
+target_labels = -1 * torch.ones(len(proposals), dtype=torch.long)
+target_bbox_deltas = torch.zeros(len(proposals), num_classes * 4, dtype=torch.float)
+
+for i, proposal in enumerate(proposals):
+    iou = calculate_iou(proposal.unsqueeze(0), gt_boxes)
+    max_iou = iou.max()
+
+    if max_iou >= POS_IOU_THRESHOLD: # Positive sample
+        target_labels[i] = gt_labels[0] # Assign actual class label (e.g., 1 for dog)
+        deltas = bbox_transform(proposal.unsqueeze(0), gt_boxes)
+        target_bbox_deltas[i, (gt_labels[0].item() * 4) : ((gt_labels[0].item() + 1) * 4)] = deltas
+    elif max_iou < NEG_IOU_THRESHOLD: # Negative sample
+        target_labels[i] = 0 # Assign background label
+    # Else, target_labels[i] remains -1, meaning it's ignored for loss calculation
+
+print(target_labels, target_bbox_deltas)
+# --- 5. Model Initialization and Training Setup ---
+
+model = FastRCNNModel(num_classes=num_classes)
+
+optim = torch.optim.SGD(model.parameters(), lr=0.001, momentum=0.9)
+criterion_cls = nn.CrossEntropyLoss(ignore_index=-1) # Ignore -1 labels
+criterion_reg = nn.MSELoss()
+
+epochs = 50
+
+# Prepare ROIs for training loop: [image_idx, x1, y1, x2, y2]
+rois_for_training = torch.cat([
+    torch.zeros(proposals.shape[0], 1), # image_idx = 0 for all proposals
+    proposals
+], dim=1)
+
+# --- 6. Training Loop ---
+
+print("--- Training Loop Demonstration with Dummy Labels ---")
+for epoch in range(epochs):
+    total_cls_loss = 0.0
+    total_reg_loss = 0.0
+    model.train() # Set model to training mode
+
+    # Forward pass
+    class_scores, bbox_predictions = model(input_image, rois_for_training)
+
+    # Classification Loss (only for samples that are not 'ignored')
+    valid_indices_cls = (target_labels != -1)
+    if valid_indices_cls.any():
+        cls_loss = criterion_cls(class_scores[valid_indices_cls], target_labels[valid_indices_cls])
+        total_cls_loss = cls_loss.item()
+    else:
+        cls_loss = torch.tensor(0.0, device=input_image.device)
+
+    # Bounding Box Regression Loss (only for positive samples, class 'dog')
+    positive_mask = (target_labels == 1) # Target label 1 is 'dog'
+    if positive_mask.any():
+        # Select predictions and targets only for positive samples and the relevant class (dog, index 1)
+        pred_deltas = bbox_predictions[positive_mask, (1 * 4) : ((1 + 1) * 4)] # Class 1 (dog) bbox deltas
+        true_deltas = target_bbox_deltas[positive_mask, (1 * 4) : ((1 + 1) * 4)]
+        # print("t", true_deltas,target_bbox_deltas)
+        reg_loss = criterion_reg(pred_deltas, true_deltas)
+        total_reg_loss = reg_loss.item()
+    else:
+        reg_loss = torch.tensor(0.0, device=input_image.device)
+
+    loss = cls_loss + reg_loss
+
+    optim.zero_grad()
+    loss.backward()
+    optim.step()
+
+    print(f"Epoch {epoch+1}, Total Loss: {loss.item():.4f}, Class Loss: {cls_loss.item():.4f}, Reg Loss: {reg_loss.item():.4f}")
+
+print("--- Training complete. Running inference with trained model ---")
+
+
+# --- 7. Inference and Visualization ---
+
+model.eval() # Set the model to evaluation mode
+
+# Prepare ROIs for inference
+rois_for_inference = torch.cat([
+    torch.zeros(proposals.shape[0], 1), # image_idx = 0 for all proposals
+    proposals
+], dim=1)
+
+with torch.no_grad():
+    class_outputs, bbox_outputs = model(input_image, rois_for_inference)
+
+    probabilities = F.softmax(class_outputs, dim=1)
+
+    _, predicted_classes = torch.max(probabilities, dim=1)
+
+    # Extract the probability for the 'dog' class (index 1) for each proposal
+    cnn_predicted_scores = probabilities[:, 1]
+
+    # Refine boxes using predicted deltas
+    refined_boxes = torch.zeros_like(proposals)
+    for i in range(len(proposals)):
+        # If predicted class is background (0), keep original proposal
+        if predicted_classes[i].item() == 0:
+            refined_boxes[i] = proposals[i]
+        else:
+            # Get the 4 deltas for the predicted class (class 1 for 'dog')
+            class_idx_for_deltas = predicted_classes[i].item()
+            # Ensure class_idx is valid for bbox_outputs indexing
+            if class_idx_for_deltas >= num_classes or class_idx_for_deltas < 0: # Should not happen if predicted_classes are 0 or 1
+                refined_boxes[i] = proposals[i]
+                continue
+
+            deltas = bbox_outputs[i, (class_idx_for_deltas * 4) : ((class_idx_for_deltas + 1) * 4)]
+
+            # Apply inverse transformation to get refined box coordinates
+            px = (proposals[i, 0] + proposals[i, 2]) * 0.5
+            py = (proposals[i, 1] + proposals[i, 3]) * 0.5
+            pw = proposals[i, 2] - proposals[i, 0]
+            ph = proposals[i, 3] - proposals[i, 1]
+
+            pred_tx, pred_ty, pred_tw, pred_th = deltas
+
+            gx = pred_tx * pw + px
+            gy = pred_ty * ph + py
+            gw = torch.exp(pred_tw) * pw
+            gh = torch.exp(pred_th) * ph
+
+            refined_boxes[i, 0] = gx - 0.5 * gw
+            refined_boxes[i, 1] = gy - 0.5 * gh
+            refined_boxes[i, 2] = gx + 0.5 * gw
+            refined_boxes[i, 3] = gy + 0.5 * gh
+            # print(refined_boxes)
+
+
+# Filter out background predictions for NMS and apply score threshold
+DETECTION_SCORE_THRESHOLD = 0.5
+foreground_mask = (predicted_classes != 0) & (cnn_predicted_scores >= DETECTION_SCORE_THRESHOLD)
+filtered_proposals = refined_boxes[foreground_mask]
+filtered_scores = cnn_predicted_scores[foreground_mask]
+print("e",filtered_proposals)
+# Apply NMS
+NMS_THRESHOLD = 0.3
+if filtered_proposals.numel() > 0:
+    keep_idx = nms(filtered_proposals, filtered_scores, threshold=NMS_THRESHOLD)
+    final_boxes = filtered_proposals[keep_idx]
+    final_scores = filtered_scores[keep_idx]
+else:
+    final_boxes = torch.empty(0, 4)
+    final_scores = torch.empty(0)
+
+
+# Plotting results
+fig, axes = plt.subplots(1, 5, figsize=(30, 6))
+
+# 1. Input Image
+axes[0].imshow(img_resized_for_display)
+axes[0].set_title("1. Input Image")
+axes[0].axis('off')
+
+# 2. Ground Truth
+axes[1].imshow(img_resized_for_display)
+for box in gt_boxes:
+    rect = patches.Rectangle((box[0].item(), box[1].item()), (box[2]-box[0]).item(), (box[3]-box[1]).item(),
+                             linewidth=2, edgecolor='g', facecolor='none')
+    axes[1].add_patch(rect)
+axes[1].set_title("2. Ground Truth")
+axes[1].axis('off')
+
+# 3. Initial Region Proposals
+axes[2].imshow(img_resized_for_display)
+for box in proposals:
+    rect = patches.Rectangle((box[0], box[1]), box[2]-box[0], box[3]-box[1],
+                             linewidth=1, edgecolor='r', facecolor='none')
+    axes[2].add_patch(rect)
+axes[2].set_title(f"3. Initial Region Proposals ({len(proposals)})")
+axes[2].axis('off')
+
+# 4. Refined Proposals (Before NMS)
+axes[3].imshow(img_resized_for_display)
+for box in refined_boxes[:4]:
+    rect = patches.Rectangle((box[0].item(), box[1].item()), (box[2]-box[0]).item(), (box[3]-box[1]).item(),
+                             linewidth=1, edgecolor='blue', facecolor='none') # Blue for refined
+    axes[3].add_patch(rect)
+axes[3].set_title("4. Refined Proposals (Before NMS)")
+axes[3].axis('off')
+
+
+# 5. Final Detections (After NMS)
+axes[4].imshow(img_resized_for_display)
+for box, score in zip(final_boxes, final_scores):
+    score_item = score.item() if torch.is_tensor(score) else score
+    # Convert tensor coordinates to Python floats using .item()
+    rect = patches.Rectangle((box[0].item(), box[1].item()), (box[2]-box[0]).item(), (box[3]-box[1]).item(),
+                             linewidth=2, edgecolor='g', facecolor='none')
+    axes[4].add_patch(rect) # Adjusted index
+    axes[4].text(box[0].item(), box[1].item()-5, f"{score_item:.2f}", color='white', fontsize=12, bbox=dict(facecolor='green', alpha=0.5))
+axes[4].set_title("5. Final Detections (After NMS)")
+axes[4].axis('off')
+
+plt.tight_layout()
+plt.show()
