@@ -1,0 +1,129 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+from PIL import Image
+from torchvision import transforms
+import numpy as np
+torch.manual_seed(0)
+
+target_size = 5
+n_anchor = 2
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+img_train = Image.open('train.png').convert('L').resize((target_size, target_size))
+img_train = transforms.ToTensor()(img_train).unsqueeze(0).to(device)
+# print(img_train)
+gt_box = torch.tensor([3.5, 0.5, 2.0, 2.0]).to(device) # cx, cy, w, h
+
+class SimpleRPN(nn.Module):
+    def __init__(self, in_ch=1):
+        super().__init__()
+        # 5x5 -(3x3 conv, pad 1)-> 5x5 피처맵 출력 유지
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_ch, 1, kernel_size=3, padding=1),
+            nn.ReLU(),
+        )
+        self.score_layer = nn.Conv2d(1, n_anchor * 2, 1)
+        self.loc_layer = nn.Conv2d(1, n_anchor * 4, 1)
+
+    def forward(self, x):
+        feat = self.conv(x) # shape: (1, 64, 5, 5)
+        return self.loc_layer(feat), self.score_layer(feat), feat
+
+model = SimpleRPN(in_ch=1).to(device)
+optimizer = optim.Adam(model.parameters(), lr=0.005)
+
+scales = [2.5, 5]
+ratios = [ 0.5]
+anchor_base = torch.tensor([[s*(r**0.5), s/(r**0.5)] for s in scales for r in ratios]).to(device)
+# print("b",anchor_base)
+
+for t in range(500):
+  optimizer.zero_grad()
+  locs, scores,feat = model(img_train)
+
+  # Update slicing to (row=0, col=3) for gt_box center (3.5, 0.5)
+  pred_scores = scores.view(1, n_anchor, 2, target_size, target_size)[:, :, :, 0, 3]
+  pred_locs = locs.view(1, n_anchor, 4, target_size, target_size)[:, :, :, 0, 3]
+
+  cls_loss = F.cross_entropy(pred_scores.transpose(1, 2), torch.ones(1, 2, dtype=torch.long).to(device))
+
+  # if t==499:
+    # print("feat",cls_loss )
+
+  target_deltas = []
+  for i in range(n_anchor):
+        aw, ah = anchor_base[i]
+        # Update reference points for dx, dy to new gt_box center
+        dx = (gt_box[0] - 3.5) / aw
+        dy = (gt_box[1] - 0.5) / ah
+        dw = torch.log(gt_box[2] / aw)
+        dh = torch.log(gt_box[3] / ah)
+        target_deltas.append(torch.stack([dx, dy, dw, dh]))
+
+  target_deltas = torch.stack(target_deltas).unsqueeze(0)
+  loc_loss = F.smooth_l1_loss(pred_locs, target_deltas)
+
+  # if t==1:
+  #   print("feat",loc_loss) 
+
+  (cls_loss + loc_loss).backward()
+  if t%10==0:
+    print("a",cls_loss,loc_loss)
+  optimizer.step()
+
+# 5. 추론 및 데이터 시각화
+model.eval()
+with torch.no_grad():
+    l, s,f = model(img_train)
+
+    # 피처맵 (0,3) 지점에서 최적의 앵커 선택
+    prob = torch.softmax(s.view(1, n_anchor, 2, target_size, target_size)[0, :, :, 0, 3], dim=1)[:, 1]
+    best_a = torch.argmax(prob)
+
+    print("e", best_a)
+
+    init_aw, init_ah = anchor_base[best_a].cpu()
+    delta = l.view(1, n_anchor, 4, target_size,target_size)[0, best_a, :, 0, 3].cpu()
+    print("a", l.view(1, n_anchor, 4, target_size, target_size)[0, best_a, :, 0, 3] )
+    # 피처맵 (0,3) -> 원본 좌표 (3.5, 0.5)에 보정치 적용
+    refined_cx = 3.5 + delta[0] * init_aw
+    refined_cy = 0.5 + delta[1] * init_ah
+    refined_w = init_aw * torch.exp(delta[2])
+    refined_h = init_ah * torch.exp(delta[3])
+    print(refined_cx,refined_cy,refined_w,refined_h)
+
+# 6. 시각화
+plt.figure(figsize=(4, 4))
+plt.imshow(img_train.squeeze().cpu().numpy(), cmap='gray', interpolation='nearest')
+ax = plt.gca()
+
+cr=["cyan","gold"]
+
+center_x_img = float(3)
+center_y_img = float(0)
+
+        # For each base anchor (2 in this case)
+for i in range(n_anchor):
+    bw, bh = anchor_base[i].cpu().numpy()
+            # Calculate top-left corner (x1, y1) for plotting
+    x1 = center_x_img + 0.5 - bw / 2
+    y1 = center_y_img + 0.5 - bh / 2
+
+            # Create a rectangle patch for the anchor box
+    rect = patches.Rectangle((x1, y1), bw, bh, fill=False, color=cr[i%len(cr)])
+    ax.add_patch(rect)
+
+# Plot the Ground Truth box (optional, but good for comparison)
+ax.add_patch(patches.Rectangle((gt_box[0].cpu()-gt_box[2].cpu()/2, gt_box[1].cpu()-gt_box[3].cpu()/2),
+             gt_box[2].cpu(), gt_box[3].cpu(), fill=False, color='green', ls='--', lw=2, label='GT Box'))
+
+# Plot the refined box
+ax.add_patch(patches.Rectangle((refined_cx-refined_w/2, refined_cy-refined_h/2), refined_w, refined_h, fill=False, color='red', lw=3, label='Refined Box'))
+
+plt.xticks(range(5)); plt.yticks(range(5)); plt.grid(True, alpha=0.3)
+plt.legend(); plt.title("RPN Anchors, GT and Refined Box (Pad=1, Feature Map 5x5)"); plt.show()
