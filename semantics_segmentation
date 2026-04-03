@@ -1,0 +1,244 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision.transforms as transforms
+from PIL import Image
+import matplotlib.pyplot as plt
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+import skimage.measure # Added for instance mask generation
+from skimage import draw # Import for drawing more complex shapes
+import os # Import os for checking file existence
+
+torch.manual_seed(1)
+# 1. 초간단 세그멘테이션 모델 정의 (Encoder-Decoder 구조)
+class SimpleSegNet(nn.Module):
+    def __init__(self, num_classes):
+        super(SimpleSegNet, self).__init__()
+        # 특징 추출 (Downsampling)
+        self.enc1 = nn.Conv2d(3, 4, kernel_size=3, padding=1)
+        self.enc2 = nn.Conv2d(4, 5, kernel_size=3, padding=1)
+        self.pool = nn.MaxPool2d(2, 2)
+
+        # 복원 (Upsampling)
+        self.dec1 = nn.Conv2d(5, 4, kernel_size=3, padding=1)
+        self.dec2 = nn.Conv2d(4, num_classes, kernel_size=3, padding=1)
+        # Removed self.upsample as F.interpolate will be used directly
+
+    def forward(self, x):
+        initial_h, initial_w = x.shape[2:] # Get the original input spatial dimensions (e.g., 5x5)
+
+        x = F.relu(self.enc1(x))
+        # if epoch==498: # Print before pooling
+        #   print("t", x)
+        x = self.pool(x)
+        # if epoch==498: # Print before pooling
+        #   print("t", x)
+
+        x = F.relu(self.enc2(x))
+        # if epoch==498: # Print before pooling
+        #     print("t", x)
+        x = self.pool(x) # For a 5x5 input, this will result in a 1x1 spatial dimension
+        # if epoch==498: # Print after pooling
+        #     print("t:", x)
+        # Upsample to an intermediate size. For a 1x1 feature map, upsample to 2x2 first.
+        x = F.interpolate(x, size=(2, 2), mode='bilinear', align_corners=True)
+        # if epoch == 498:
+        #   print(x)
+        x = F.relu(self.dec1(x))
+
+        # Upsample to the final target output size (initial_h, initial_w) which is 5x5
+        x = F.interpolate(x, size=(initial_h, initial_w), mode='bilinear', align_corners=True)
+
+        x = self.dec2(x)
+        # if epoch == 498:
+        #   print(x)
+        return x
+
+# --- Paths for the image and its corresponding manual mask ---
+image_path = 'e.png'  # Specify your original image file path here
+mask_path = 'e_mask.png' # Specify the path to your manually labeled mask file here
+
+# --- BEGIN: Load e_mask.png directly ---
+# Ensure the e_mask.png file is uploaded to the Colab environment (e.g., in /content/)
+if not os.path.exists(mask_path):
+    raise FileNotFoundError(f"'{mask_path}' not found. Please upload your custom mask file to '/content/{mask_path}' and re-run the cell.")
+else:
+    print(f"'{mask_path}' found. Loading the custom mask file.")
+# --- END: Load e_mask.png directly ---
+
+# Custom Dataset for a single image with a manually provided mask
+class SingleImageSegmentationDataset(Dataset):
+    def __init__(self, image_path, mask_file_path, image_size=(5, 5)): # User requested 5x5
+        self.image_path = image_path
+        self.mask_file_path = mask_file_path
+        self.image_size = image_size
+
+        # Load the original image
+        self.image = Image.open(image_path).convert("RGB")
+
+        # Load the manually labeled mask and convert to grayscale
+        mask_image_pil = Image.open(mask_file_path).convert("L")
+        mask_image_resized = mask_image_pil.resize(image_size, Image.NEAREST)
+        mask_np = np.array(mask_image_resized)
+
+        # Remap unique non-zero values to 1, 2, ... for a fixed number of classes
+        unique_labels = np.unique(mask_np[mask_np > 0]) # Get unique non-zero labels
+        label_mapping = {old_label: new_label + 1 for new_label, old_label in enumerate(unique_labels)}
+
+        # Apply mapping: 0 remains 0, other unique labels get sequential IDs starting from 1
+        remapped_mask_np = np.zeros_like(mask_np)
+        for old_label, new_label in label_mapping.items():
+            remapped_mask_np[mask_np == old_label] = new_label
+
+        mask_np = remapped_mask_np
+
+        # Set num_classes based on the remapped unique labels + 1 for background
+        # If there are N unique non-zero labels, num_classes will be N+1 (0 for background)
+        self.num_classes = len(unique_labels) + 1
+        # If no non-zero labels, num_classes is 1 (only background)
+        if self.num_classes == 0: self.num_classes = 1
+
+        # Ensure mask is a tensor with appropriate type (long for CrossEntropyLoss)
+        self.generated_mask = torch.from_numpy(mask_np.astype(np.long))
+
+        # Define transformations for the image
+        self.transform = transforms.Compose([
+            transforms.Resize(image_size),
+            transforms.ToTensor(),
+        ])
+
+    def __len__(self):
+        return 1 # This dataset contains only one image
+
+    def __getitem__(self, idx):
+        # Transform the image
+        transformed_image = self.transform(self.image)
+        # Return the transformed image and the loaded mask
+        return transformed_image, self.generated_mask
+
+# 2. 모델 준비 및 이미지 로드
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Create custom dataset first to determine the actual number of classes
+single_image_dataset = SingleImageSegmentationDataset(
+    image_path=image_path,
+    mask_file_path=mask_path, # Pass the path to the manually labeled mask
+    image_size=(5, 5) # User requested 5x5
+)
+
+# Initialize the model with the dynamically determined num_classes from the dataset
+model = SimpleSegNet(num_classes=single_image_dataset.num_classes).to(device).train() # Set to train mode initially
+
+# For training, we use a batch size. If batch_size > 1, the single image will be repeated.
+batch_size = 1 # You can adjust this. The single image will be sampled repeatedly.
+
+single_image_dataloader = DataLoader(single_image_dataset, batch_size=batch_size, shuffle=True)
+# print(single_image_dataloader)
+num_epochs = 500 # Revert to 500 epochs for better training
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+criterion = nn.CrossEntropyLoss()
+
+
+model.train()
+for epoch in range(num_epochs):
+    model.train() # Set model to training mode
+    running_loss = 0.0
+    for i, (inputs, labels) in enumerate(single_image_dataloader):
+        inputs = inputs.to(device)
+        labels = labels.to(device)
+        if epoch ==498:
+          print(labels)
+
+        # Zero the parameter gradients
+        optimizer.zero_grad()
+
+        # Forward pass
+        outputs = model(inputs)
+        # if epoch == 498:
+        #   print("a", outputs)
+        # Calculate loss
+        loss = criterion(outputs, labels)
+        # if epoch == 498:
+        #   print("a", len(single_image_dataset))
+        # Backward pass and optimize
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item() * inputs.size(0)
+
+    # Note: len(single_image_dataset) will be 1, so this epoch loss might be misleading
+    # as it's calculating loss over a dataset with only one unique item (repeatedly sampled).
+    epoch_loss = running_loss / len(single_image_dataset)
+    if epoch % 10 == 0:
+      print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {epoch_loss:.4f}')
+
+# Assume we're processing a single image given a path
+# Use the same image_path for inference for consistency
+filename = "e.png"
+
+# 이미지 로드 및 전처리
+img = Image.open(filename).convert("RGB")
+original_size = img.size
+
+# --- Display image, resized to 256x256 for consistent plotting with masks ---
+img_display_size = (256, 256) # Keep display size larger for readability
+img_for_display = img.resize(img_display_size)
+
+transform = transforms.Compose([
+    transforms.Resize((5, 5)), # User requested 5x5 input for model
+    transforms.ToTensor(),
+])
+input_tensor = transform(img).unsqueeze(0).to(device)
+
+# 3. 추론 (Inference)
+model.eval()
+with torch.no_grad():
+    output = model(input_tensor)
+    # print(output)
+    # 결과값 중 가장 확률 높은 클래스 선택
+    mask = torch.argmax(output, dim=1).squeeze(0).cpu().numpy()
+    print(mask)
+
+# Get one batch from the dataloader
+# Since it's a single image dataset, next(iter(...)) will yield the single image and its mask
+inputs, labels = next(iter(single_image_dataloader))
+
+# Move to CPU for visualization
+inputs = inputs.cpu()
+labels = labels.cpu()
+
+# Take the first (and only) image and mask from the batch
+# The batch dimension needs to be removed
+image_tensor = inputs[0] # Shape: [C, H, W]
+mask_tensor = labels[0]  # Shape: [H, W]
+
+# Convert image tensor to numpy array and transpose to (H, W, C) for matplotlib
+# Normalize to [0, 1] if not already, or convert to PIL Image for direct display
+image_display = image_tensor.permute(1, 2, 0).numpy()
+
+# Convert mask tensor to numpy array
+mask_display = mask_tensor.numpy()
+
+# 4. 결과 시각화 - 모든 플롯을 한 줄에 표시
+plt.figure(figsize=(15, 5)) # 전체 그림 크기를 더 넓게 조정
+
+plt.subplot(1, 3, 1) # 1행 3열 중 첫 번째
+plt.title("Original Image")
+plt.imshow(img_for_display) # Use the resized image for display
+plt.axis('off')
+
+plt.subplot(1, 3, 2) # 1행 3열 중 두 번째
+plt.title("Predicted Instance Mask")
+plt.imshow(mask, cmap='jet') # Use 'jet' or other distinct colormap for multiple classes
+plt.axis('off')
+
+plt.subplot(1, 3, 3) # 1행 3열 중 세 번째
+plt.title("Generated Ground Truth Instance Mask")
+# Use a colormap suitable for multiple labels and set vmin/vmax for clear distinction
+plt.imshow(mask_display, cmap='nipy_spectral', vmin=0, vmax=single_image_dataset.num_classes - 1)
+plt.colorbar(label='Instance ID')
+plt.axis('off')
+
+plt.tight_layout()
+plt.show()
