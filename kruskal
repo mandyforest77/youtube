@@ -1,0 +1,31 @@
+def find(x):
+    if parent[x] != x:
+        parent[x] = find(parent[x])
+    return parent[x]
+
+def union(x, y):
+    root_x = find(x)
+    root_y = find(y)
+    if root_x < root_y:
+        parent[root_y] = root_x
+    else:
+        parent[root_x] = root_y
+
+# 가중치 기준 오름차순 정렬  
+edges =[(1, 4, 2), (2, 4, 3), (0, 2, 7), (0, 1, 10), (2, 3, 10), (3, 4, 10)]
+        
+parent = [0,1,2,3,4]
+total_weight = 0
+count = 0
+    
+for u, v, w in edges:
+        # 사이클이 형성되지 않을 때만 선택
+    if find(u) != find(v):
+        union(u, v)
+        total_weight += w
+        count += 1
+            # 간선의 개수가 V개(노드 수 - 1)가 되면 종료
+        if count == 4:
+            break
+                
+print(total_weight)
