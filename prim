@@ -1,0 +1,44 @@
+INF = float('inf')
+n = 5  # 도시 개수 (0~4)
+
+# 1. 인접 행렬 (도시 간 연결 비용)
+adj = [[INF] * n for _ in range(n)]
+edges = [(0,1,10), (0,2,7), (1,4,2), (2,3,10), (2,4,3), (3,4,10)]
+
+for u, v, w in edges:
+    adj[u][v] = adj[v][u] = w
+
+# 2. 준비물
+min_dist = [INF] * n  # 각 도시로 가는 최소 비용
+visited = [False] * n # 방문 여부 (우리 팀원인지)
+
+min_dist[0] = 0       # 시작점(0번 도시) 비용은 0
+total_weight = 0
+parent = [None] * n  # 각 도시가 누구에 의해 연결되었는지 저장
+
+
+# 3. 프림 알고리즘 시작
+for _ in range(n):
+    # [STEP 1] 아직 안 가본 도시 중 비용이 가장 저렴한 도시(curr) 찾기
+    min_val = INF
+    curr = -1
+    
+    for i in range(n):
+        if not visited[i] and min_dist[i] < min_val:
+            min_val = min_dist[i]
+            curr = i
+
+    # [STEP 2] 해당 도시를 우리 팀(MST)에 포함
+    visited[curr] = True
+    total_weight += min_val
+
+    # [STEP 3] 새로 들어온 도시(curr)를 거쳐서 갈 수 있는 이웃 도시들의 비용 갱신
+    for next_node in range(n):
+        # 아직 안 가본 도시이고, 현재 도시를 거쳐서 가는 게 더 싸다면 업데이트
+        if not visited[next_node] and adj[curr][next_node] < min_dist[next_node]:
+            min_dist[next_node] = adj[curr][next_node]
+            parent[next_node] = curr  # "next_node는 curr에 의해 연결됨"을 기록
+
+            # 결과 출력 시 확인
+print(f"3번 도시의 부모: {parent[3]}") # 출력: 2
+print(total_weight) # 결과: 22
